@@ -1,0 +1,1877 @@
+--[[
+    RABAK Explorer
+    Remote explorer + script viewer + remote spy
+
+    Usage:
+      Run this file as a LocalScript / paste it into your executor.
+
+    Tabs:
+      REMOTES  - list remotes, inspect them, and fire/invoke them
+      SCRIPTS  - list scripts and view decompiled source
+      SPY      - capture outgoing and incoming remote traffic
+
+    Notes:
+      Script source viewing needs decompile() support from your executor.
+      Outgoing remote logging needs hookmetamethod() / getnamecallmethod().
+      Listing and firing remotes works without those APIs.
+]]
+
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then
+    return
+end
+
+if type(_G.RabakExplorerCleanup) == "function" then
+    pcall(_G.RabakExplorerCleanup)
+end
+
+local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+local oldGui = playerGui:FindFirstChild("RabakExplorer")
+if oldGui then
+    oldGui:Destroy()
+end
+
+--------------------------------------------------------------------------------
+-- Executor API detection
+--------------------------------------------------------------------------------
+
+local API = {
+    getScripts = type(getscripts) == "function" and getscripts or nil,
+    getLoadedModules = type(getloadedmodules) == "function" and getloadedmodules or nil,
+    getNilInstances = type(getnilinstances) == "function" and getnilinstances or nil,
+    decompile = type(decompile) == "function" and decompile or nil,
+    getScriptBytecode = type(getscriptbytecode) == "function" and getscriptbytecode or nil,
+    hookMetamethod = type(hookmetamethod) == "function" and hookmetamethod or nil,
+    getNamecallMethod = type(getnamecallmethod) == "function" and getnamecallmethod or nil,
+    loadstring = type(loadstring) == "function" and loadstring or nil,
+}
+
+local function makeCClosure(callback)
+    if type(newcclosure) == "function" then
+        local ok, wrapped = pcall(newcclosure, callback)
+        if ok and wrapped then
+            return wrapped
+        end
+    end
+
+    return callback
+end
+
+local function copyText(text)
+    if type(setclipboard) == "function" then
+        local ok = pcall(setclipboard, text)
+        return ok
+    end
+
+    if type(toclipboard) == "function" then
+        local ok = pcall(toclipboard, text)
+        return ok
+    end
+
+    return false
+end
+
+--------------------------------------------------------------------------------
+-- Theme + helpers
+--------------------------------------------------------------------------------
+
+local COLORS = {
+    background = Color3.fromRGB(12, 13, 19),
+    panel = Color3.fromRGB(20, 22, 30),
+    panelRaised = Color3.fromRGB(27, 30, 40),
+    panelHover = Color3.fromRGB(34, 37, 49),
+    row = Color3.fromRGB(25, 27, 37),
+    stroke = Color3.fromRGB(45, 49, 64),
+    text = Color3.fromRGB(244, 245, 250),
+    muted = Color3.fromRGB(139, 145, 164),
+    dim = Color3.fromRGB(95, 101, 119),
+    accent = Color3.fromRGB(124, 92, 255),
+    accentAlt = Color3.fromRGB(67, 214, 255),
+    green = Color3.fromRGB(64, 220, 160),
+    orange = Color3.fromRGB(255, 176, 70),
+    red = Color3.fromRGB(255, 100, 116),
+    selected = Color3.fromRGB(45, 37, 74),
+}
+
+local function create(className, properties, parent)
+    local instance = Instance.new(className)
+
+    for property, value in pairs(properties or {}) do
+        instance[property] = value
+    end
+
+    instance.Parent = parent
+    return instance
+end
+
+local function addCorner(parent, radius)
+    return create("UICorner", {
+        CornerRadius = UDim.new(0, radius),
+    }, parent)
+end
+
+local function addStroke(parent, color, transparency)
+    return create("UIStroke", {
+        Color = color or COLORS.stroke,
+        Thickness = 1,
+        Transparency = transparency or 0,
+    }, parent)
+end
+
+local function getPath(instance)
+    if not instance then
+        return "Unknown"
+    end
+
+    local ok, path = pcall(instance.GetFullName, instance)
+    if ok and path then
+        return path
+    end
+
+    return instance.Name or "Unknown"
+end
+
+local function trim(text)
+    return (text:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function formatValue(value, depth, seen)
+    depth = depth or 0
+    local valueType = typeof(value)
+
+    if valueType == "string" then
+        return string.format("%q", value)
+    end
+
+    if valueType == "number" or valueType == "boolean" or valueType == "nil" then
+        return tostring(value)
+    end
+
+    if valueType == "Instance" then
+        return getPath(value)
+    end
+
+    if valueType == "table" then
+        if depth >= 2 then
+            return "{...}"
+        end
+
+        seen = seen or {}
+        if seen[value] then
+            return "{...}"
+        end
+        seen[value] = true
+
+        local parts = {}
+        local count = 0
+
+        for key, item in pairs(value) do
+            count += 1
+            if count > 15 then
+                table.insert(parts, "...")
+                break
+            end
+
+            local keyText
+            if type(key) == "string" and key:match("^[%a_][%w_]*$") then
+                keyText = key
+            else
+                keyText = "[" .. formatValue(key, depth + 1, seen) .. "]"
+            end
+
+            table.insert(parts, keyText .. " = " .. formatValue(item, depth + 1, seen))
+        end
+
+        seen[value] = nil
+        return "{" .. table.concat(parts, ", ") .. "}"
+    end
+
+    return "<" .. valueType .. ">"
+end
+
+local function formatArguments(arguments)
+    local parts = {}
+    local count = arguments.n or #arguments
+
+    for index = 1, count do
+        table.insert(parts, formatValue(arguments[index]))
+    end
+
+    return table.concat(parts, ", ")
+end
+
+local function isRemote(instance)
+    return instance:IsA("RemoteEvent")
+        or instance:IsA("UnreliableRemoteEvent")
+        or instance:IsA("RemoteFunction")
+end
+
+local function isRemoteEvent(instance)
+    return instance:IsA("RemoteEvent") or instance:IsA("UnreliableRemoteEvent")
+end
+
+local function remoteKind(remote)
+    if remote:IsA("RemoteFunction") then
+        return "FUNCTION"
+    end
+
+    if remote:IsA("UnreliableRemoteEvent") then
+        return "UNRELIABLE"
+    end
+
+    return "EVENT"
+end
+
+local function timeStamp()
+    return os.date("%H:%M:%S")
+end
+
+--------------------------------------------------------------------------------
+-- Window shell
+--------------------------------------------------------------------------------
+
+local cleanup
+local watchIncoming
+
+local screenGui = create("ScreenGui", {
+    Name = "RabakExplorer",
+    DisplayOrder = 101,
+    IgnoreGuiInset = true,
+    ResetOnSpawn = false,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, playerGui)
+
+local main = create("Frame", {
+    Name = "Window",
+    BackgroundColor3 = COLORS.background,
+    BorderSizePixel = 0,
+    ClipsDescendants = true,
+    Position = UDim2.new(0.5, -400, 0.5, -270),
+    Size = UDim2.fromOffset(800, 540),
+}, screenGui)
+addCorner(main, 14)
+addStroke(main, COLORS.stroke, 0.2)
+
+create("UIGradient", {
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(21, 22, 32)),
+        ColorSequenceKeypoint.new(1, COLORS.background),
+    }),
+    Rotation = 90,
+}, main)
+
+local accentLine = create("Frame", {
+    BackgroundColor3 = COLORS.accent,
+    BorderSizePixel = 0,
+    Size = UDim2.new(1, 0, 0, 2),
+    ZIndex = 2,
+}, main)
+create("UIGradient", {
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, COLORS.accent),
+        ColorSequenceKeypoint.new(1, COLORS.accentAlt),
+    }),
+}, accentLine)
+
+local header = create("Frame", {
+    BackgroundTransparency = 1,
+    Size = UDim2.new(1, 0, 0, 58),
+}, main)
+
+local logo = create("Frame", {
+    BackgroundColor3 = COLORS.accent,
+    BorderSizePixel = 0,
+    Position = UDim2.fromOffset(16, 12),
+    Size = UDim2.fromOffset(34, 34),
+}, header)
+addCorner(logo, 10)
+create("UIGradient", {
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, COLORS.accent),
+        ColorSequenceKeypoint.new(1, COLORS.accentAlt),
+    }),
+    Rotation = 135,
+}, logo)
+
+create("TextLabel", {
+    BackgroundTransparency = 1,
+    Font = Enum.Font.GothamBlack,
+    Size = UDim2.fromScale(1, 1),
+    Text = "R",
+    TextColor3 = Color3.fromRGB(255, 255, 255),
+    TextSize = 18,
+}, logo)
+
+create("TextLabel", {
+    BackgroundTransparency = 1,
+    Font = Enum.Font.GothamBold,
+    Position = UDim2.fromOffset(58, 9),
+    Size = UDim2.fromOffset(300, 20),
+    Text = "RABAK EXPLORER",
+    TextColor3 = COLORS.text,
+    TextSize = 17,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, header)
+
+create("TextLabel", {
+    BackgroundTransparency = 1,
+    Font = Enum.Font.GothamMedium,
+    Position = UDim2.fromOffset(58, 29),
+    Size = UDim2.fromOffset(300, 14),
+    Text = "REMOTES  /  SCRIPTS  /  REMOTE SPY",
+    TextColor3 = COLORS.muted,
+    TextSize = 9,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, header)
+
+local closeButton = create("TextButton", {
+    AutoButtonColor = false,
+    BackgroundColor3 = COLORS.panelRaised,
+    BorderSizePixel = 0,
+    Font = Enum.Font.GothamBold,
+    Position = UDim2.new(1, -48, 0, 13),
+    Size = UDim2.fromOffset(32, 32),
+    Text = "X",
+    TextColor3 = COLORS.muted,
+    TextSize = 11,
+    ZIndex = 20,
+}, header)
+addCorner(closeButton, 9)
+addStroke(closeButton, COLORS.stroke, 0.3)
+
+closeButton.MouseEnter:Connect(function()
+    closeButton.TextColor3 = COLORS.red
+    closeButton.BackgroundColor3 = Color3.fromRGB(52, 34, 44)
+end)
+
+closeButton.MouseLeave:Connect(function()
+    closeButton.TextColor3 = COLORS.muted
+    closeButton.BackgroundColor3 = COLORS.panelRaised
+end)
+
+create("Frame", {
+    BackgroundColor3 = COLORS.stroke,
+    BackgroundTransparency = 0.4,
+    BorderSizePixel = 0,
+    Position = UDim2.fromOffset(16, 58),
+    Size = UDim2.new(1, -32, 0, 1),
+}, main)
+
+local tabBar = create("Frame", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(16, 68),
+    Size = UDim2.new(1, -32, 0, 34),
+}, main)
+
+local tabDefinitions = {
+    { id = "remotes", label = "REMOTES" },
+    { id = "scripts", label = "SCRIPTS" },
+    { id = "spy", label = "REMOTE SPY" },
+}
+
+local tabButtons = {}
+
+for index, definition in ipairs(tabDefinitions) do
+    local button = create("TextButton", {
+        AutoButtonColor = false,
+        BackgroundColor3 = COLORS.panel,
+        BorderSizePixel = 0,
+        Font = Enum.Font.GothamBold,
+        Position = UDim2.fromOffset((index - 1) * 112, 0),
+        Size = UDim2.fromOffset(104, 34),
+        Text = definition.label,
+        TextColor3 = COLORS.muted,
+        TextSize = 10,
+    }, tabBar)
+    addCorner(button, 8)
+    local stroke = addStroke(button, COLORS.stroke, 0.45)
+
+    tabButtons[definition.id] = {
+        button = button,
+        stroke = stroke,
+    }
+end
+
+local refreshButton = create("TextButton", {
+    AutoButtonColor = false,
+    BackgroundColor3 = COLORS.panel,
+    BorderSizePixel = 0,
+    Font = Enum.Font.GothamBold,
+    Position = UDim2.new(1, -108, 0, 0),
+    Size = UDim2.fromOffset(108, 34),
+    Text = "REFRESH",
+    TextColor3 = COLORS.accentAlt,
+    TextSize = 10,
+}, tabBar)
+addCorner(refreshButton, 8)
+addStroke(refreshButton, COLORS.accentAlt, 0.7)
+
+refreshButton.MouseEnter:Connect(function()
+    refreshButton.BackgroundColor3 = COLORS.panelHover
+end)
+
+refreshButton.MouseLeave:Connect(function()
+    refreshButton.BackgroundColor3 = COLORS.panel
+end)
+
+local content = create("Frame", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(16, 110),
+    Size = UDim2.new(1, -32, 0, 398),
+}, main)
+
+create("Frame", {
+    BackgroundColor3 = COLORS.stroke,
+    BackgroundTransparency = 0.5,
+    BorderSizePixel = 0,
+    Position = UDim2.fromOffset(16, 512),
+    Size = UDim2.new(1, -32, 0, 1),
+}, main)
+
+local statusLabel = create("TextLabel", {
+    BackgroundTransparency = 1,
+    Font = Enum.Font.GothamMedium,
+    Position = UDim2.fromOffset(16, 516),
+    Size = UDim2.new(0.55, -16, 0, 16),
+    Text = "Ready",
+    TextColor3 = COLORS.muted,
+    TextSize = 9,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, main)
+
+local apiLabel = create("TextLabel", {
+    BackgroundTransparency = 1,
+    Font = Enum.Font.GothamMedium,
+    Position = UDim2.new(0.55, 0, 0, 516),
+    Size = UDim2.new(0.45, -16, 0, 16),
+    Text = "",
+    TextColor3 = COLORS.dim,
+    TextSize = 9,
+    TextXAlignment = Enum.TextXAlignment.Right,
+}, main)
+
+local function setStatus(text, color)
+    statusLabel.Text = text
+    statusLabel.TextColor3 = color or COLORS.muted
+end
+
+local function createListPanel(title)
+    local panel = create("Frame", {
+        BackgroundColor3 = COLORS.panel,
+        BorderSizePixel = 0,
+        Size = UDim2.fromOffset(270, 398),
+    }, content)
+    addCorner(panel, 12)
+    addStroke(panel, COLORS.stroke, 0.25)
+
+    create("TextLabel", {
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        Position = UDim2.fromOffset(12, 12),
+        Size = UDim2.fromOffset(150, 16),
+        Text = title,
+        TextColor3 = COLORS.text,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, panel)
+
+    local countLabel = create("TextLabel", {
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        Position = UDim2.new(1, -142, 0, 12),
+        Size = UDim2.fromOffset(130, 16),
+        Text = "0",
+        TextColor3 = COLORS.dim,
+        TextSize = 9,
+        TextXAlignment = Enum.TextXAlignment.Right,
+    }, panel)
+
+    local searchBox = create("TextBox", {
+        BackgroundColor3 = COLORS.background,
+        BorderSizePixel = 0,
+        ClearTextOnFocus = false,
+        Font = Enum.Font.Gotham,
+        PlaceholderColor3 = COLORS.dim,
+        PlaceholderText = "Search...",
+        Position = UDim2.fromOffset(10, 38),
+        Size = UDim2.new(1, -20, 0, 30),
+        Text = "",
+        TextColor3 = COLORS.text,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, panel)
+    addCorner(searchBox, 7)
+    addStroke(searchBox, COLORS.stroke, 0.4)
+    create("UIPadding", {
+        PaddingLeft = UDim.new(0, 8),
+        PaddingRight = UDim.new(0, 8),
+    }, searchBox)
+
+    local scroll = create("ScrollingFrame", {
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        BackgroundTransparency = 1,
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+        Position = UDim2.fromOffset(8, 76),
+        ScrollBarImageColor3 = COLORS.accent,
+        ScrollBarThickness = 4,
+        ScrollingDirection = Enum.ScrollingDirection.Y,
+        Size = UDim2.new(1, -16, 1, -84),
+    }, panel)
+
+    create("UIListLayout", {
+        Padding = UDim.new(0, 4),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, scroll)
+
+    local emptyLabel = create("TextLabel", {
+        BackgroundTransparency = 1,
+        Font = Enum.Font.Gotham,
+        Size = UDim2.new(1, 0, 0, 34),
+        Text = "Nothing here yet.",
+        TextColor3 = COLORS.dim,
+        TextSize = 10,
+    }, scroll)
+
+    return {
+        panel = panel,
+        countLabel = countLabel,
+        searchBox = searchBox,
+        scroll = scroll,
+        emptyLabel = emptyLabel,
+    }
+end
+
+--------------------------------------------------------------------------------
+-- Tab switching
+--------------------------------------------------------------------------------
+
+local remotesPanel = create("Frame", {
+    BackgroundTransparency = 1,
+    Size = UDim2.fromScale(1, 1),
+    Visible = false,
+}, content)
+
+local scriptsPanel = create("Frame", {
+    BackgroundTransparency = 1,
+    Size = UDim2.fromScale(1, 1),
+    Visible = false,
+}, content)
+
+local spyPanel = create("Frame", {
+    BackgroundTransparency = 1,
+    Size = UDim2.fromScale(1, 1),
+    Visible = false,
+}, content)
+
+local activeTab = "remotes"
+
+local function updateTabStyles()
+    for id, tab in pairs(tabButtons) do
+        local active = id == activeTab
+        tab.button.BackgroundColor3 = if active then COLORS.selected else COLORS.panel
+        tab.button.TextColor3 = if active then COLORS.text else COLORS.muted
+        tab.stroke.Color = if active then COLORS.accent else COLORS.stroke
+        tab.stroke.Transparency = if active then 0.15 else 0.45
+    end
+end
+
+local function setTab(id)
+    activeTab = id
+    remotesPanel.Visible = id == "remotes"
+    scriptsPanel.Visible = id == "scripts"
+    spyPanel.Visible = id == "spy"
+    updateTabStyles()
+end
+
+--------------------------------------------------------------------------------
+-- Remotes
+--------------------------------------------------------------------------------
+
+local remoteListPanel = createListPanel("REMOTES")
+remoteListPanel.panel.Parent = remotesPanel
+
+local remoteDetailPanel = create("Frame", {
+    BackgroundColor3 = COLORS.panel,
+    BorderSizePixel = 0,
+    Position = UDim2.fromOffset(280, 0),
+    Size = UDim2.fromOffset(488, 398),
+}, remotesPanel)
+addCorner(remoteDetailPanel, 12)
+addStroke(remoteDetailPanel, COLORS.stroke, 0.25)
+
+create("TextLabel", {
+    BackgroundTransparency = 1,
+    Font = Enum.Font.GothamBold,
+    Position = UDim2.fromOffset(14, 12),
+    Size = UDim2.fromOffset(220, 16),
+    Text = "REMOTE DETAILS",
+    TextColor3 = COLORS.text,
+    TextSize = 11,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, remoteDetailPanel)
+
+local remoteClassLabel = create("TextLabel", {
+    BackgroundColor3 = COLORS.selected,
+    BackgroundTransparency = 0,
+    BorderSizePixel = 0,
+    Font = Enum.Font.GothamBold,
+    Position = UDim2.fromOffset(14, 34),
+    Size = UDim2.fromOffset(96, 18),
+    Text = "NO TARGET",
+    TextColor3 = COLORS.accent,
+    TextSize = 8,
+}, remoteDetailPanel)
+addCorner(remoteClassLabel, 5)
+
+local copyPathButton = create("TextButton", {
+    AutoButtonColor = false,
+    BackgroundColor3 = COLORS.panelRaised,
+    BorderSizePixel = 0,
+    Font = Enum.Font.GothamBold,
+    Position = UDim2.new(1, -112, 0, 12),
+    Size = UDim2.fromOffset(98, 24),
+    Text = "COPY PATH",
+    TextColor3 = COLORS.muted,
+    TextSize = 8,
+}, remoteDetailPanel)
+addCorner(copyPathButton, 6)
+addStroke(copyPathButton, COLORS.stroke, 0.4)
+
+local remotePathLabel = create("TextLabel", {
+    BackgroundTransparency = 1,
+    Font = Enum.Font.Code,
+    Position = UDim2.fromOffset(14, 58),
+    Size = UDim2.new(1, -28, 0, 30),
+    Text = "Select a remote from the list.",
+    TextColor3 = COLORS.muted,
+    TextSize = 9,
+    TextWrapped = true,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top,
+}, remoteDetailPanel)
+
+create("TextLabel", {
+    BackgroundTransparency = 1,
+    Font = Enum.Font.GothamBold,
+    Position = UDim2.fromOffset(14, 94),
+    Size = UDim2.fromOffset(200, 14),
+    Text = "ARGUMENTS",
+    TextColor3 = COLORS.dim,
+    TextSize = 8,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, remoteDetailPanel)
+
+local argumentsBox = create("TextBox", {
+    BackgroundColor3 = COLORS.background,
+    BorderSizePixel = 0,
+    ClearTextOnFocus = false,
+    Font = Enum.Font.Code,
+    MultiLine = true,
+    PlaceholderColor3 = COLORS.dim,
+    PlaceholderText = 'Lua values: "hello", 123, true, {key = "value"}',
+    Position = UDim2.fromOffset(14, 112),
+    Size = UDim2.new(1, -28, 0, 64),
+    Text = "",
+    TextColor3 = COLORS.text,
+    TextSize = 10,
+    TextWrapped = true,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top,
+}, remoteDetailPanel)
+addCorner(argumentsBox, 7)
+addStroke(argumentsBox, COLORS.stroke, 0.35)
+create("UIPadding", {
+    PaddingBottom = UDim.new(0, 6),
+    PaddingLeft = UDim.new(0, 8),
+    PaddingRight = UDim.new(0, 8),
+    PaddingTop = UDim.new(0, 6),
+}, argumentsBox)
+
+create("TextLabel", {
+    BackgroundTransparency = 1,
+    Font = Enum.Font.Gotham,
+    Position = UDim2.fromOffset(14, 182),
+    Size = UDim2.new(1, -28, 0, 14),
+    Text = "Arguments are parsed as Lua. Leave empty to send none.",
+    TextColor3 = COLORS.dim,
+    TextSize = 8,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, remoteDetailPanel)
+
+local fireButton = create("TextButton", {
+    AutoButtonColor = false,
+    BackgroundColor3 = COLORS.accent,
+    BorderSizePixel = 0,
+    Font = Enum.Font.GothamBold,
+    Position = UDim2.fromOffset(14, 204),
+    Size = UDim2.fromOffset(144, 32),
+    Text = "FIRE SERVER",
+    TextColor3 = Color3.fromRGB(255, 255, 255),
+    TextSize = 9,
+}, remoteDetailPanel)
+addCorner(fireButton, 7)
+
+create("TextLabel", {
+    BackgroundTransparency = 1,
+    Font = Enum.Font.GothamBold,
+    Position = UDim2.fromOffset(14, 248),
+    Size = UDim2.fromOffset(160, 14),
+    Text = "OUTPUT",
+    TextColor3 = COLORS.dim,
+    TextSize = 8,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, remoteDetailPanel)
+
+local clearOutputButton = create("TextButton", {
+    AutoButtonColor = false,
+    BackgroundColor3 = COLORS.panelRaised,
+    BorderSizePixel = 0,
+    Font = Enum.Font.GothamBold,
+    Position = UDim2.new(1, -76, 0, 244),
+    Size = UDim2.fromOffset(62, 20),
+    Text = "CLEAR",
+    TextColor3 = COLORS.muted,
+    TextSize = 7,
+}, remoteDetailPanel)
+addCorner(clearOutputButton, 5)
+
+local outputScroll = create("ScrollingFrame", {
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    BackgroundColor3 = COLORS.background,
+    BackgroundTransparency = 0.15,
+    BorderSizePixel = 0,
+    CanvasSize = UDim2.new(0, 0, 0, 0),
+    Position = UDim2.fromOffset(14, 266),
+    ScrollBarImageColor3 = COLORS.accent,
+    ScrollBarThickness = 4,
+    Size = UDim2.new(1, -28, 0, 120),
+}, remoteDetailPanel)
+addCorner(outputScroll, 7)
+
+local outputLabel = create("TextLabel", {
+    AutomaticSize = Enum.AutomaticSize.Y,
+    BackgroundTransparency = 1,
+    Font = Enum.Font.Code,
+    Position = UDim2.fromOffset(8, 7),
+    Size = UDim2.new(1, -16, 0, 0),
+    Text = "-- Output appears here.",
+    TextColor3 = COLORS.muted,
+    TextSize = 9,
+    TextWrapped = true,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top,
+}, outputScroll)
+
+local selectedRemote = nil
+local remoteCache = {}
+local remoteRows = {}
+local remoteSearch = ""
+
+local function updateRemoteDetails()
+    local valid = selectedRemote and selectedRemote.Parent
+
+    if valid then
+        remoteClassLabel.Text = remoteKind(selectedRemote)
+        remotePathLabel.Text = getPath(selectedRemote)
+        fireButton.Text = if selectedRemote:IsA("RemoteFunction") then "INVOKE SERVER" else "FIRE SERVER"
+        fireButton.BackgroundColor3 = if selectedRemote:IsA("RemoteFunction") then COLORS.orange else COLORS.accent
+        fireButton.TextColor3 = if selectedRemote:IsA("RemoteFunction") then COLORS.background else Color3.fromRGB(255, 255, 255)
+    else
+        remoteClassLabel.Text = "NO TARGET"
+        remotePathLabel.Text = "Select a remote from the list."
+        fireButton.Text = "FIRE SERVER"
+        fireButton.BackgroundColor3 = COLORS.panelRaised
+        fireButton.TextColor3 = COLORS.dim
+    end
+end
+
+local function styleRemoteRows()
+    for _, row in ipairs(remoteRows) do
+        local selected = row.remote == selectedRemote
+        row.button.BackgroundColor3 = if selected then COLORS.selected else COLORS.row
+        row.stroke.Color = if selected then COLORS.accent else COLORS.stroke
+        row.stroke.Transparency = if selected then 0.25 else 0.65
+        row.nameLabel.TextColor3 = if selected then COLORS.text else Color3.fromRGB(214, 217, 228)
+        row.kindLabel.TextColor3 = if selected then COLORS.accentAlt else COLORS.dim
+    end
+end
+
+local function selectRemote(remote)
+    selectedRemote = remote
+    updateRemoteDetails()
+    styleRemoteRows()
+end
+
+local function clearRemoteRows()
+    for _, row in ipairs(remoteRows) do
+        row.button:Destroy()
+    end
+    table.clear(remoteRows)
+end
+
+local function addRemoteRow(remote, layoutOrder)
+    local button = create("TextButton", {
+        AutoButtonColor = false,
+        BackgroundColor3 = COLORS.row,
+        BorderSizePixel = 0,
+        LayoutOrder = layoutOrder,
+        Size = UDim2.new(1, 0, 0, 42),
+        Text = "",
+    }, remoteListPanel.scroll)
+    addCorner(button, 7)
+    local stroke = addStroke(button, COLORS.stroke, 0.65)
+
+    local nameLabel = create("TextLabel", {
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        Position = UDim2.fromOffset(10, 5),
+        Size = UDim2.new(1, -20, 0, 14),
+        Text = remote.Name,
+        TextColor3 = Color3.fromRGB(214, 217, 228),
+        TextSize = 10,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, button)
+
+    local kindLabel = create("TextLabel", {
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        Position = UDim2.fromOffset(10, 22),
+        Size = UDim2.new(1, -20, 0, 12),
+        Text = remoteKind(remote),
+        TextColor3 = COLORS.dim,
+        TextSize = 7,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, button)
+
+    local row = {
+        button = button,
+        nameLabel = nameLabel,
+        kindLabel = kindLabel,
+        stroke = stroke,
+        remote = remote,
+    }
+    table.insert(remoteRows, row)
+
+    button.MouseEnter:Connect(function()
+        if selectedRemote ~= remote then
+            button.BackgroundColor3 = COLORS.panelHover
+        end
+    end)
+
+    button.MouseLeave:Connect(function()
+        styleRemoteRows()
+    end)
+
+    button.MouseButton1Click:Connect(function()
+        selectRemote(remote)
+    end)
+end
+
+local function renderRemoteRows()
+    clearRemoteRows()
+
+    local query = remoteSearch:lower()
+    local shown = 0
+
+    for _, remote in ipairs(remoteCache) do
+        local path = getPath(remote):lower()
+        if query == ""
+            or remote.Name:lower():find(query, 1, true)
+            or path:find(query, 1, true)
+        then
+            shown += 1
+            if shown <= 500 then
+                addRemoteRow(remote, shown)
+            end
+        end
+    end
+
+    remoteListPanel.emptyLabel.Visible = shown == 0
+    remoteListPanel.emptyLabel.Text = if #remoteCache == 0 then "No remotes found." else "No matches."
+    remoteListPanel.countLabel.Text = string.format("%d FOUND", #remoteCache)
+    styleRemoteRows()
+end
+
+local function refreshRemotes()
+    remoteCache = {}
+    local seen = {}
+
+    for _, instance in ipairs(game:GetDescendants()) do
+        if isRemote(instance) and not seen[instance] then
+            seen[instance] = true
+            table.insert(remoteCache, instance)
+
+            if watchIncoming then
+                watchIncoming(instance)
+            end
+        end
+    end
+
+    table.sort(remoteCache, function(a, b)
+        return getPath(a):lower() < getPath(b):lower()
+    end)
+
+    if selectedRemote and not selectedRemote.Parent then
+        selectedRemote = nil
+    end
+
+    updateRemoteDetails()
+    renderRemoteRows()
+end
+
+local function parsePrimitive(token)
+    token = trim(token)
+
+    if token == "nil" then
+        return nil
+    end
+    if token == "true" then
+        return true
+    end
+    if token == "false" then
+        return false
+    end
+
+    local number = tonumber(token)
+    if number then
+        return number
+    end
+
+    local quoted = token:match('^"(.*)"$') or token:match("^'(.*)'$")
+    if quoted then
+        return quoted
+    end
+
+    return nil, "Unsupported value: " .. token
+end
+
+local function parseArguments(source)
+    source = trim(source)
+    if source == "" then
+        return { n = 0 }
+    end
+
+    if API.loadstring then
+        local loadOk, chunk, compileError = pcall(API.loadstring, "return " .. source)
+        if not loadOk then
+            return nil, tostring(chunk)
+        end
+        if not chunk then
+            return nil, compileError
+        end
+
+        local results = table.pack(pcall(chunk))
+        if not results[1] then
+            return nil, tostring(results[2])
+        end
+
+        local arguments = { n = results.n - 1 }
+        for index = 2, results.n do
+            arguments[index - 1] = results[index]
+        end
+
+        return arguments
+    end
+
+    local arguments = { n = 0 }
+    for token in string.gmatch(source .. ",", "([^,]*),") do
+        if trim(token) ~= "" then
+            local value, parseError = parsePrimitive(token)
+            if parseError then
+                return nil, parseError
+            end
+
+            arguments.n += 1
+            arguments[arguments.n] = value
+        end
+    end
+
+    return arguments
+end
+
+local remoteOutput = ""
+
+local function appendOutput(text, color)
+    remoteOutput = remoteOutput == "" and text or (remoteOutput .. "\n" .. text)
+    if #remoteOutput > 20000 then
+        remoteOutput = remoteOutput:sub(-20000)
+    end
+
+    outputLabel.Text = remoteOutput
+    outputLabel.TextColor3 = color or COLORS.muted
+
+    task.defer(function()
+        if outputScroll.Parent then
+            outputScroll.CanvasPosition = Vector2.new(0, outputScroll.AbsoluteCanvasSize.Y)
+        end
+    end)
+end
+
+local function copyRemotePath()
+    if not selectedRemote or not selectedRemote.Parent then
+        setStatus("No remote selected.", COLORS.orange)
+        return
+    end
+
+    if copyText(getPath(selectedRemote)) then
+        setStatus("Remote path copied.", COLORS.green)
+    else
+        setStatus("Clipboard API is unavailable.", COLORS.red)
+    end
+end
+
+local function runRemote()
+    local remote = selectedRemote
+    if not remote or not remote.Parent then
+        setStatus("Select a remote first.", COLORS.orange)
+        return
+    end
+
+    local arguments, parseError = parseArguments(argumentsBox.Text)
+    if not arguments then
+        appendOutput("Argument error: " .. tostring(parseError), COLORS.red)
+        setStatus("Could not parse arguments.", COLORS.red)
+        return
+    end
+
+    local argumentCount = arguments.n
+
+    if remote:IsA("RemoteFunction") then
+        appendOutput(string.format("%s  INVOKE  %s", timeStamp(), getPath(remote)), COLORS.orange)
+        setStatus("Invoking RemoteFunction...", COLORS.orange)
+
+        task.spawn(function()
+            local ok, result = pcall(remote.InvokeServer, remote, table.unpack(arguments, 1, argumentCount))
+            if ok then
+                appendOutput("Result: " .. formatValue(result), COLORS.green)
+                setStatus("RemoteFunction returned.", COLORS.green)
+            else
+                appendOutput("Invoke error: " .. tostring(result), COLORS.red)
+                setStatus("RemoteFunction failed.", COLORS.red)
+            end
+        end)
+    else
+        local ok, err = pcall(remote.FireServer, remote, table.unpack(arguments, 1, argumentCount))
+        if ok then
+            appendOutput(string.format("%s  FIRE  %s  (%d args)", timeStamp(), getPath(remote), argumentCount), COLORS.green)
+            setStatus("Remote fired.", COLORS.green)
+        else
+            appendOutput("Fire error: " .. tostring(err), COLORS.red)
+            setStatus("Remote failed.", COLORS.red)
+        end
+    end
+end
+
+--------------------------------------------------------------------------------
+-- Scripts
+--------------------------------------------------------------------------------
+
+local scriptListPanel = createListPanel("SCRIPTS")
+scriptListPanel.panel.Parent = scriptsPanel
+
+local scriptDetailPanel = create("Frame", {
+    BackgroundColor3 = COLORS.panel,
+    BorderSizePixel = 0,
+    Position = UDim2.fromOffset(280, 0),
+    Size = UDim2.fromOffset(488, 398),
+}, scriptsPanel)
+addCorner(scriptDetailPanel, 12)
+addStroke(scriptDetailPanel, COLORS.stroke, 0.25)
+
+create("TextLabel", {
+    BackgroundTransparency = 1,
+    Font = Enum.Font.GothamBold,
+    Position = UDim2.fromOffset(14, 12),
+    Size = UDim2.fromOffset(200, 16),
+    Text = "SCRIPT SOURCE",
+    TextColor3 = COLORS.text,
+    TextSize = 11,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, scriptDetailPanel)
+
+local copySourceButton = create("TextButton", {
+    AutoButtonColor = false,
+    BackgroundColor3 = COLORS.panelRaised,
+    BorderSizePixel = 0,
+    Font = Enum.Font.GothamBold,
+    Position = UDim2.new(1, -112, 0, 12),
+    Size = UDim2.fromOffset(98, 24),
+    Text = "COPY SOURCE",
+    TextColor3 = COLORS.muted,
+    TextSize = 8,
+}, scriptDetailPanel)
+addCorner(copySourceButton, 6)
+addStroke(copySourceButton, COLORS.stroke, 0.4)
+
+local scriptClassLabel = create("TextLabel", {
+    BackgroundColor3 = COLORS.selected,
+    BorderSizePixel = 0,
+    Font = Enum.Font.GothamBold,
+    Position = UDim2.fromOffset(14, 34),
+    Size = UDim2.fromOffset(96, 18),
+    Text = "NO TARGET",
+    TextColor3 = COLORS.accent,
+    TextSize = 8,
+}, scriptDetailPanel)
+addCorner(scriptClassLabel, 5)
+
+local scriptPathLabel = create("TextLabel", {
+    BackgroundTransparency = 1,
+    Font = Enum.Font.Code,
+    Position = UDim2.fromOffset(14, 58),
+    Size = UDim2.new(1, -28, 0, 30),
+    Text = "Select a script from the list.",
+    TextColor3 = COLORS.muted,
+    TextSize = 9,
+    TextWrapped = true,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top,
+}, scriptDetailPanel)
+
+local codeScroll = create("ScrollingFrame", {
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    BackgroundColor3 = COLORS.background,
+    BackgroundTransparency = 0.1,
+    BorderSizePixel = 0,
+    CanvasSize = UDim2.new(0, 0, 0, 0),
+    Position = UDim2.fromOffset(14, 94),
+    ScrollBarImageColor3 = COLORS.accent,
+    ScrollBarThickness = 5,
+    ScrollingDirection = Enum.ScrollingDirection.Y,
+    Size = UDim2.new(1, -28, 0, 292),
+}, scriptDetailPanel)
+addCorner(codeScroll, 8)
+
+local codeLabel = create("TextLabel", {
+    AutomaticSize = Enum.AutomaticSize.Y,
+    BackgroundTransparency = 1,
+    Font = Enum.Font.Code,
+    Position = UDim2.fromOffset(10, 9),
+    Size = UDim2.new(1, -20, 0, 0),
+    Text = "-- Select a script to view its decompiled source.",
+    TextColor3 = COLORS.muted,
+    TextSize = 10,
+    TextWrapped = true,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top,
+}, codeScroll)
+
+local scriptCache = {}
+local scriptRows = {}
+local scriptSearch = ""
+local selectedScript = nil
+local currentSource = nil
+local sourceCache = {}
+
+local function clearScriptRows()
+    for _, row in ipairs(scriptRows) do
+        row.button:Destroy()
+    end
+    table.clear(scriptRows)
+end
+
+local function styleScriptRows()
+    for _, row in ipairs(scriptRows) do
+        local selected = row.script == selectedScript
+        row.button.BackgroundColor3 = if selected then COLORS.selected else COLORS.row
+        row.stroke.Color = if selected then COLORS.accent else COLORS.stroke
+        row.stroke.Transparency = if selected then 0.25 else 0.65
+        row.nameLabel.TextColor3 = if selected then COLORS.text else Color3.fromRGB(214, 217, 228)
+        row.kindLabel.TextColor3 = if selected then COLORS.accentAlt else COLORS.dim
+    end
+end
+
+local function readScriptSource(script)
+    if sourceCache[script] then
+        return sourceCache[script], "cache"
+    end
+
+    if API.decompile then
+        local ok, result = pcall(API.decompile, script)
+        if ok and type(result) == "string" and #result > 0 then
+            sourceCache[script] = result
+            return result, "decompile"
+        end
+    end
+
+    local ok, source = pcall(function()
+        return script.Source
+    end)
+
+    if ok and type(source) == "string" and #source > 0 then
+        sourceCache[script] = source
+        return source, "source"
+    end
+
+    if API.getScriptBytecode then
+        local bytecodeOk, bytecode = pcall(API.getScriptBytecode, script)
+        if bytecodeOk and type(bytecode) == "string" then
+            return nil, string.format("No decompile() API found. Retrieved %d bytes of bytecode instead.", #bytecode)
+        end
+    end
+
+    return nil, "Could not read this script. Your executor needs decompile() support."
+end
+
+local function showScript(script)
+    selectedScript = script
+    styleScriptRows()
+
+    if not script then
+        scriptClassLabel.Text = "NO TARGET"
+        scriptPathLabel.Text = "Select a script from the list."
+        codeLabel.Text = "-- Select a script to view its decompiled source."
+        codeLabel.TextColor3 = COLORS.muted
+        currentSource = nil
+        return
+    end
+
+    scriptClassLabel.Text = script.ClassName:upper()
+    scriptPathLabel.Text = getPath(script)
+    codeLabel.Text = "-- Decompiling..."
+    codeLabel.TextColor3 = COLORS.muted
+    currentSource = nil
+
+    task.defer(function()
+        if selectedScript ~= script then
+            return
+        end
+
+        local source, sourceInfo = readScriptSource(script)
+
+        if selectedScript ~= script then
+            return
+        end
+
+        if source then
+            currentSource = source
+            codeLabel.Text = source
+            codeLabel.TextColor3 = Color3.fromRGB(218, 221, 232)
+            setStatus(string.format("Loaded source via %s.", tostring(sourceInfo)), COLORS.green)
+        else
+            currentSource = nil
+            codeLabel.Text = "-- " .. tostring(sourceInfo)
+            codeLabel.TextColor3 = COLORS.orange
+            setStatus("Source unavailable.", COLORS.orange)
+        end
+
+        codeScroll.CanvasPosition = Vector2.new(0, 0)
+    end)
+end
+
+local function addScriptRow(script, layoutOrder)
+    local button = create("TextButton", {
+        AutoButtonColor = false,
+        BackgroundColor3 = COLORS.row,
+        BorderSizePixel = 0,
+        LayoutOrder = layoutOrder,
+        Size = UDim2.new(1, 0, 0, 42),
+        Text = "",
+    }, scriptListPanel.scroll)
+    addCorner(button, 7)
+    local stroke = addStroke(button, COLORS.stroke, 0.65)
+
+    local nameLabel = create("TextLabel", {
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        Position = UDim2.fromOffset(10, 5),
+        Size = UDim2.new(1, -20, 0, 14),
+        Text = script.Name,
+        TextColor3 = Color3.fromRGB(214, 217, 228),
+        TextSize = 10,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, button)
+
+    local kindLabel = create("TextLabel", {
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        Position = UDim2.fromOffset(10, 22),
+        Size = UDim2.new(1, -20, 0, 12),
+        Text = script.ClassName:upper(),
+        TextColor3 = COLORS.dim,
+        TextSize = 7,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, button)
+
+    local row = {
+        button = button,
+        nameLabel = nameLabel,
+        kindLabel = kindLabel,
+        stroke = stroke,
+        script = script,
+    }
+    table.insert(scriptRows, row)
+
+    button.MouseEnter:Connect(function()
+        if selectedScript ~= script then
+            button.BackgroundColor3 = COLORS.panelHover
+        end
+    end)
+
+    button.MouseLeave:Connect(function()
+        styleScriptRows()
+    end)
+
+    button.MouseButton1Click:Connect(function()
+        showScript(script)
+    end)
+end
+
+local function renderScriptRows()
+    clearScriptRows()
+
+    local query = scriptSearch:lower()
+    local shown = 0
+
+    for _, script in ipairs(scriptCache) do
+        local path = getPath(script):lower()
+        if query == ""
+            or script.Name:lower():find(query, 1, true)
+            or path:find(query, 1, true)
+        then
+            shown += 1
+            if shown <= 500 then
+                addScriptRow(script, shown)
+            end
+        end
+    end
+
+    scriptListPanel.emptyLabel.Visible = shown == 0
+    scriptListPanel.emptyLabel.Text = if #scriptCache == 0 then "No scripts found." else "No matches."
+    scriptListPanel.countLabel.Text = string.format("%d FOUND", #scriptCache)
+    styleScriptRows()
+end
+
+local function refreshScripts()
+    scriptCache = {}
+    local seen = {}
+
+    local function addScript(instance)
+        if not instance or seen[instance] then
+            return
+        end
+
+        if instance:IsA("LuaSourceContainer") then
+            seen[instance] = true
+            table.insert(scriptCache, instance)
+        end
+    end
+
+    if API.getScripts then
+        pcall(function()
+            for _, instance in ipairs(API.getScripts()) do
+                addScript(instance)
+            end
+        end)
+    end
+
+    if API.getLoadedModules then
+        pcall(function()
+            for _, instance in ipairs(API.getLoadedModules()) do
+                addScript(instance)
+            end
+        end)
+    end
+
+    for _, instance in ipairs(game:GetDescendants()) do
+        addScript(instance)
+    end
+
+    if API.getNilInstances then
+        pcall(function()
+            for _, instance in ipairs(API.getNilInstances()) do
+                addScript(instance)
+            end
+        end)
+    end
+
+    table.sort(scriptCache, function(a, b)
+        return getPath(a):lower() < getPath(b):lower()
+    end)
+
+    renderScriptRows()
+end
+
+local function copyCurrentSource()
+    if not currentSource then
+        setStatus("No source loaded.", COLORS.orange)
+        return
+    end
+
+    if copyText(currentSource) then
+        setStatus("Script source copied.", COLORS.green)
+    else
+        setStatus("Clipboard API is unavailable.", COLORS.red)
+    end
+end
+
+--------------------------------------------------------------------------------
+-- Remote spy
+--------------------------------------------------------------------------------
+
+local spyShell = create("Frame", {
+    BackgroundColor3 = COLORS.panel,
+    BorderSizePixel = 0,
+    Size = UDim2.fromScale(1, 1),
+}, spyPanel)
+addCorner(spyShell, 12)
+addStroke(spyShell, COLORS.stroke, 0.25)
+
+create("TextLabel", {
+    BackgroundTransparency = 1,
+    Font = Enum.Font.GothamBold,
+    Position = UDim2.fromOffset(16, 12),
+    Size = UDim2.fromOffset(160, 16),
+    Text = "REMOTE SPY",
+    TextColor3 = COLORS.text,
+    TextSize = 11,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, spyShell)
+
+local spyCountLabel = create("TextLabel", {
+    BackgroundTransparency = 1,
+    Font = Enum.Font.GothamBold,
+    Position = UDim2.fromOffset(16, 30),
+    Size = UDim2.fromOffset(90, 14),
+    Text = "0 EVENTS",
+    TextColor3 = COLORS.dim,
+    TextSize = 8,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, spyShell)
+
+local spyHintLabel = create("TextLabel", {
+    BackgroundTransparency = 1,
+    Font = Enum.Font.Gotham,
+    Position = UDim2.fromOffset(110, 30),
+    Size = UDim2.new(1, -390, 0, 14),
+    Text = "Outgoing + incoming RemoteEvent traffic",
+    TextColor3 = COLORS.dim,
+    TextSize = 8,
+    TextXAlignment = Enum.TextXAlignment.Left,
+}, spyShell)
+
+local spyClearButton = create("TextButton", {
+    AutoButtonColor = false,
+    BackgroundColor3 = COLORS.panelRaised,
+    BorderSizePixel = 0,
+    Font = Enum.Font.GothamBold,
+    Position = UDim2.new(1, -198, 0, 11),
+    Size = UDim2.fromOffset(72, 26),
+    Text = "CLEAR",
+    TextColor3 = COLORS.muted,
+    TextSize = 8,
+}, spyShell)
+addCorner(spyClearButton, 6)
+addStroke(spyClearButton, COLORS.stroke, 0.4)
+
+local spyToggleButton = create("TextButton", {
+    AutoButtonColor = false,
+    BackgroundColor3 = Color3.fromRGB(27, 58, 48),
+    BorderSizePixel = 0,
+    Font = Enum.Font.GothamBold,
+    Position = UDim2.new(1, -118, 0, 11),
+    Size = UDim2.fromOffset(102, 26),
+    Text = "CAPTURING",
+    TextColor3 = COLORS.green,
+    TextSize = 8,
+}, spyShell)
+addCorner(spyToggleButton, 6)
+addStroke(spyToggleButton, COLORS.green, 0.5)
+
+local spyScroll = create("ScrollingFrame", {
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    BackgroundColor3 = COLORS.background,
+    BackgroundTransparency = 0.15,
+    BorderSizePixel = 0,
+    CanvasSize = UDim2.new(0, 0, 0, 0),
+    Position = UDim2.fromOffset(10, 52),
+    ScrollBarImageColor3 = COLORS.accent,
+    ScrollBarThickness = 5,
+    ScrollingDirection = Enum.ScrollingDirection.Y,
+    Size = UDim2.new(1, -20, 1, -62),
+}, spyShell)
+addCorner(spyScroll, 8)
+
+create("UIListLayout", {
+    Padding = UDim.new(0, 4),
+    SortOrder = Enum.SortOrder.LayoutOrder,
+}, spyScroll)
+
+local spyEmptyLabel = create("TextLabel", {
+    BackgroundTransparency = 1,
+    Font = Enum.Font.Gotham,
+    Position = UDim2.fromOffset(0, 8),
+    Size = UDim2.new(1, 0, 0, 30),
+    Text = "No remote traffic captured yet.",
+    TextColor3 = COLORS.dim,
+    TextSize = 10,
+}, spyScroll)
+
+local spyState = {
+    enabled = true,
+    hooked = false,
+    watched = {},
+}
+
+local spyEntries = {}
+local spyCounter = 0
+
+local function updateSpyToggleStyle()
+    if spyState.enabled then
+        spyToggleButton.Text = "CAPTURING"
+        spyToggleButton.TextColor3 = COLORS.green
+        spyToggleButton.BackgroundColor3 = Color3.fromRGB(27, 58, 48)
+    else
+        spyToggleButton.Text = "PAUSED"
+        spyToggleButton.TextColor3 = COLORS.muted
+        spyToggleButton.BackgroundColor3 = COLORS.panelRaised
+    end
+end
+
+local function spyLog(direction, remote, method, arguments)
+    if not spyState.enabled or not remote then
+        return
+    end
+
+    spyCounter += 1
+
+    local entry = {
+        id = spyCounter,
+        direction = direction,
+        remote = remote,
+        method = method,
+        arguments = arguments,
+        time = timeStamp(),
+    }
+
+    local row = create("TextButton", {
+        AutoButtonColor = false,
+        BackgroundColor3 = COLORS.row,
+        BorderSizePixel = 0,
+        Font = Enum.Font.Code,
+        LayoutOrder = -spyCounter,
+        Size = UDim2.new(1, 0, 0, 30),
+        Text = string.format(
+            "%s  [%s]  %s(%s)",
+            entry.time,
+            direction,
+            getPath(remote),
+            formatArguments(arguments)
+        ),
+        TextColor3 = if direction == "OUT" then COLORS.orange else COLORS.green,
+        TextSize = 9,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, spyScroll)
+    addCorner(row, 5)
+    create("UIPadding", {
+        PaddingLeft = UDim.new(0, 8),
+        PaddingRight = UDim.new(0, 8),
+    }, row)
+
+    entry.row = row
+    table.insert(spyEntries, 1, entry)
+    spyEmptyLabel.Visible = false
+    spyCountLabel.Text = string.format("%d EVENTS", spyCounter)
+
+    row.MouseEnter:Connect(function()
+        row.BackgroundColor3 = COLORS.panelHover
+    end)
+
+    row.MouseLeave:Connect(function()
+        row.BackgroundColor3 = COLORS.row
+    end)
+
+    row.MouseButton1Click:Connect(function()
+        if remote.Parent then
+            selectRemote(remote)
+            setTab("remotes")
+        end
+    end)
+
+    while #spyEntries > 200 do
+        local removed = table.remove(spyEntries)
+        if removed.row then
+            removed.row:Destroy()
+        end
+    end
+end
+
+local function clearSpyLog()
+    for _, entry in ipairs(spyEntries) do
+        if entry.row then
+            entry.row:Destroy()
+        end
+    end
+
+    table.clear(spyEntries)
+    spyCounter = 0
+    spyCountLabel.Text = "0 EVENTS"
+    spyEmptyLabel.Visible = true
+end
+
+watchIncoming = function(remote)
+    if not isRemoteEvent(remote) or spyState.watched[remote] then
+        return
+    end
+
+    local connection = remote.OnClientEvent:Connect(function(...)
+        if not spyState.enabled then
+            return
+        end
+
+        pcall(spyLog, "IN", remote, "OnClientEvent", table.pack(...))
+    end)
+
+    spyState.watched[remote] = connection
+end
+
+local oldNamecall = nil
+
+local function installSpyHook()
+    if spyState.hooked then
+        return true
+    end
+
+    if not API.hookMetamethod or not API.getNamecallMethod then
+        return false, "hookmetamethod() is not available"
+    end
+
+    local function newNamecall(self, ...)
+        local method = API.getNamecallMethod()
+
+        if spyState.enabled
+            and (method == "FireServer" or method == "InvokeServer")
+            and typeof(self) == "Instance"
+            and isRemote(self)
+        then
+            pcall(spyLog, "OUT", self, method, table.pack(...))
+        end
+
+        return oldNamecall(self, ...)
+    end
+
+    local ok, result = pcall(API.hookMetamethod, game, "__namecall", makeCClosure(newNamecall))
+    if not ok or type(result) ~= "function" then
+        return false, tostring(result)
+    end
+
+    oldNamecall = result
+    spyState.hooked = true
+    return true
+end
+
+--------------------------------------------------------------------------------
+-- Event wiring
+--------------------------------------------------------------------------------
+
+local connections = {}
+local remoteRefreshQueued = false
+
+local function connect(signal, callback)
+    local connection = signal:Connect(callback)
+    table.insert(connections, connection)
+    return connection
+end
+
+for id, tab in pairs(tabButtons) do
+    connect(tab.button.MouseButton1Click, function()
+        setTab(id)
+    end)
+end
+
+remoteListPanel.searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+    remoteSearch = remoteListPanel.searchBox.Text
+    renderRemoteRows()
+end)
+
+scriptListPanel.searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+    scriptSearch = scriptListPanel.searchBox.Text
+    renderScriptRows()
+end)
+
+connect(fireButton.MouseButton1Click, runRemote)
+connect(copyPathButton.MouseButton1Click, copyRemotePath)
+connect(copySourceButton.MouseButton1Click, copyCurrentSource)
+
+connect(clearOutputButton.MouseButton1Click, function()
+    remoteOutput = ""
+    outputLabel.Text = "-- Output cleared."
+    outputLabel.TextColor3 = COLORS.dim
+    setStatus("Output cleared.")
+end)
+
+connect(spyClearButton.MouseButton1Click, function()
+    clearSpyLog()
+    setStatus("Spy log cleared.")
+end)
+
+connect(spyToggleButton.MouseButton1Click, function()
+    spyState.enabled = not spyState.enabled
+    updateSpyToggleStyle()
+    setStatus(if spyState.enabled then "Remote spy capturing." else "Remote spy paused.")
+end)
+
+connect(refreshButton.MouseButton1Click, function()
+    if activeTab == "remotes" then
+        refreshRemotes()
+        setStatus("Remote list refreshed.", COLORS.green)
+    elseif activeTab == "scripts" then
+        refreshScripts()
+        setStatus("Script list refreshed.", COLORS.green)
+    else
+        clearSpyLog()
+        setStatus("Spy log refreshed.", COLORS.green)
+    end
+end)
+
+connect(game.DescendantAdded, function(instance)
+    if not isRemote(instance) then
+        return
+    end
+
+    if isRemoteEvent(instance) then
+        watchIncoming(instance)
+    end
+
+    if activeTab == "remotes" and not remoteRefreshQueued then
+        remoteRefreshQueued = true
+
+        task.delay(1, function()
+            remoteRefreshQueued = false
+
+            if screenGui.Parent and activeTab == "remotes" then
+                refreshRemotes()
+            end
+        end)
+    end
+end)
+
+connect(game.DescendantRemoving, function(instance)
+    local connection = spyState.watched[instance]
+    if connection then
+        connection:Disconnect()
+        spyState.watched[instance] = nil
+    end
+end)
+
+-- Make the header draggable.
+local dragArea = create("TextButton", {
+    AutoButtonColor = false,
+    BackgroundTransparency = 1,
+    Size = UDim2.fromScale(1, 1),
+    Text = "",
+    ZIndex = 10,
+}, header)
+
+dragArea.InputBegan:Connect(function(input)
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1
+        and input.UserInputType ~= Enum.UserInputType.Touch
+    then
+        return
+    end
+
+    local startInputPosition = input.Position
+    local startFramePosition = main.Position
+    local moveConnection
+    local endConnection
+
+    moveConnection = UserInputService.InputChanged:Connect(function(changed)
+        if changed.UserInputType ~= Enum.UserInputType.MouseMovement
+            and changed.UserInputType ~= Enum.UserInputType.Touch
+        then
+            return
+        end
+
+        if input.UserInputType == Enum.UserInputType.Touch and changed ~= input then
+            return
+        end
+
+        local delta = changed.Position - startInputPosition
+        main.Position = UDim2.new(
+            startFramePosition.X.Scale,
+            startFramePosition.X.Offset + delta.X,
+            startFramePosition.Y.Scale,
+            startFramePosition.Y.Offset + delta.Y
+        )
+    end)
+
+    endConnection = UserInputService.InputEnded:Connect(function(ended)
+        if ended ~= input then
+            return
+        end
+
+        if moveConnection then
+            moveConnection:Disconnect()
+        end
+        if endConnection then
+            endConnection:Disconnect()
+        end
+    end)
+end)
+
+--------------------------------------------------------------------------------
+-- Cleanup + startup
+--------------------------------------------------------------------------------
+
+cleanup = function()
+    spyState.enabled = false
+
+    for _, connection in pairs(spyState.watched) do
+        connection:Disconnect()
+    end
+    table.clear(spyState.watched)
+
+    for _, connection in ipairs(connections) do
+        connection:Disconnect()
+    end
+    table.clear(connections)
+
+    if screenGui then
+        screenGui:Destroy()
+    end
+
+    if _G.RabakExplorerCleanup == cleanup then
+        _G.RabakExplorerCleanup = nil
+    end
+end
+
+_G.RabakExplorerCleanup = cleanup
+closeButton.MouseButton1Click:Connect(cleanup)
+
+local hookOk, hookError = installSpyHook()
+updateSpyToggleStyle()
+setTab("remotes")
+refreshRemotes()
+task.defer(function()
+    if screenGui.Parent then
+        refreshScripts()
+    end
+end)
+
+apiLabel.Text = string.format(
+    "decompile: %s   hook: %s   clipboard: %s",
+    API.decompile and "ready" or "missing",
+    hookOk and "ready" or "missing",
+    (type(setclipboard) == "function" or type(toclipboard) == "function") and "ready" or "missing"
+)
+
+if hookOk then
+    spyHintLabel.Text = "Outgoing + incoming RemoteEvent traffic"
+    setStatus("Ready. Remotes loaded.", COLORS.green)
+else
+    spyHintLabel.Text = "Incoming only: " .. tostring(hookError)
+    setStatus("Ready. Outgoing spy hook unavailable.", COLORS.orange)
+end
+
+
+
